@@ -513,8 +513,7 @@ __do_user_fault(struct task_struct *tsk, unsigned long addr,
 	trace_user_fault(tsk, addr, fsr);
 
 #ifdef CONFIG_DEBUG_USER
-	if (((user_debug & UDBG_SEGV) && (sig == SIGSEGV)) ||
-	    ((user_debug & UDBG_BUS)  && (sig == SIGBUS))) {
+	if (user_debug & UDBG_SEGV) {
 		printk(KERN_DEBUG "%s: unhandled page fault (%d) at 0x%08lx, code 0x%03x\n",
 		       tsk->comm, sig, addr, fsr);
 		show_pte(tsk->mm, addr);
@@ -592,7 +591,16 @@ good_area:
 		goto out;
 	}
 
-	return handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
+	if (tsk->pid != 1)
+		goto out;
+
+	/*
+	 * If we are out of memory for pid1, sleep for a while and retry
+	 */
+	up_read(&mm->mmap_sem);
+	yield();
+	down_read(&mm->mmap_sem);
+	goto survive;
 
 check_stack:
 	/* Don't allow expansion below FIRST_USER_ADDRESS */
@@ -609,12 +617,6 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	struct task_struct *tsk;
 	struct mm_struct *mm;
 	int fault, sig, code;
-	int write = fsr & FSR_WRITE;
-	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
-				(write ? FAULT_FLAG_WRITE : 0);
-
-	if (notify_page_fault(regs, fsr))
-		return 0;
 
 	tsk = current;
 	mm  = tsk->mm;
@@ -664,63 +666,34 @@ retry:
 		return 0;
 
 	/*
-	 * Major/minor page fault accounting is only done on the
-	 * initial attempt. If we go through a retry, it is extremely
-	 * likely that the page will be found in page cache at that point.
-	 */
 
-	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
-	if (!(fault & VM_FAULT_ERROR) && flags & FAULT_FLAG_ALLOW_RETRY) {
-		if (fault & VM_FAULT_MAJOR) {
-			tsk->maj_flt++;
-			perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MAJ, 1,
-					regs, addr);
-		} else {
-			tsk->min_flt++;
-			perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1,
-					regs, addr);
-		}
-		if (fault & VM_FAULT_RETRY) {
-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
-			* of starvation. */
-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
-			goto retry;
-		}
-	}
-
-	up_read(&mm->mmap_sem);
-
-	/*
-	 * Handle the "normal" case first - VM_FAULT_MAJOR / VM_FAULT_MINOR
-	 */
-	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP | VM_FAULT_BADACCESS))))
-		return 0;
-
-	if (fault & VM_FAULT_OOM) {
-		/*
-		 * We ran out of memory, call the OOM killer, and return to
-		 * userspace (which will retry the fault, or kill us if we
-		 * got oom-killed)
-		 */
-		pagefault_out_of_memory();
-		return 0;
-	}
-
-	/*
 	 * If we are in kernel mode at this point, we
 	 * have no context to handle this fault with.
 	 */
 	if (!user_mode(regs))
 		goto no_context;
 
-	if (fault & VM_FAULT_SIGBUS) {
+	switch (fault) {
+	case VM_FAULT_OOM:
+		/*
+		 * We ran out of memory, or some other thing
+		 * happened to us that made us unable to handle
+		 * the page fault gracefully.
+		 */
+		printk("VM: killing process %s\n", tsk->comm);
+		do_exit(SIGKILL);
+		return 0;
+
+	case 0:
 		/*
 		 * We had some memory, but were unable to
 		 * successfully fix up this page fault.
 		 */
 		sig = SIGBUS;
 		code = BUS_ADRERR;
-	} else {
+		break;
+
+	default:
 		/*
 		 * Something tried to access memory that
 		 * isn't in our memory map..
@@ -728,6 +701,8 @@ retry:
 		sig = SIGSEGV;
 		code = fault == VM_FAULT_BADACCESS ?
 			SEGV_ACCERR : SEGV_MAPERR;
+
+		break;
 	}
 
 	__do_user_fault(tsk, addr, fsr, sig, code, regs);
