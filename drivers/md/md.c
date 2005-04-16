@@ -877,7 +877,7 @@ static void bi_complete(struct bio *bio, int error)
 int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
 		 struct page *page, int rw, bool metadata_op)
 {
-	struct bio *bio = bio_alloc_mddev(GFP_NOIO, 1, rdev->mddev);
+	struct bio *bio = bio_alloc(GFP_NOIO, 1);
 	struct completion event;
 	int ret;
 
